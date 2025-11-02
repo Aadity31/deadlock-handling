@@ -1,24 +1,27 @@
 # decision_tree.py
 """
-Final decision tree / scoring module.
-Works on virtual allocations (v_cpu_alloc in 0..100 units, v_ram_alloc in MB).
-Keeps session-store support for wait-times and usage-history (optional).
+Decision tree scoring for low-end VM simulation.
+- VIRTUAL_RAM_MB and VIRTUAL_CPU_UNITS match app defaults (512MB, 50 units)
+- explicit deadlock detection + clearer weights
 """
 
 from collections import Counter
+import logging
 
-# Virtual PC configuration (same values used across app)
-VIRTUAL_RAM_MB = 1024    # 1 GB virtual RAM
-VIRTUAL_CPU_UNITS = 100  # virtual CPU units (percent-like scale)
+logger = logging.getLogger(__name__)
 
-# Weight coefficients (balanced for CPU+RAM)
-ALPHA_CPU = 0.35    # CPU impact
-BETA_RAM = 0.35     # RAM impact
-GAMMA_WAIT = 0.15   # Wait-time impact
-DELTA_VIS = 0.10    # Visibility on-screen impact
-EPS_HISTORY = 0.05  # User history impact
+# Virtual PC configuration for low-end demo
+VIRTUAL_RAM_MB = 512    # simulated 512 MB
+VIRTUAL_CPU_UNITS = 50  # simulated 50 CPU units
 
-# Ignore list for noisy/system processes (safe to skip)
+# Weight coefficients tuned to show visible differences on low-end
+ALPHA_CPU = 0.50    # emphasize CPU (so high CPU shows up)
+BETA_RAM = 0.25
+GAMMA_WAIT = 0.15
+DELTA_VIS = 0.06
+EPS_HISTORY = 0.04
+
+# Ignore list
 IGNORE_LIST = {
     "System Idle Process", "TextInputHost.exe", "svchost.exe",
     "RuntimeBroker.exe", "winlogon.exe", "SearchIndexer.exe",
@@ -26,7 +29,6 @@ IGNORE_LIST = {
 }
 
 def safe_name(value, pid):
-    """Return a safe string name for a process."""
     try:
         if not isinstance(value, str):
             value = str(value)
@@ -39,26 +41,14 @@ def safe_name(value, pid):
 
 def compute_scores(virtual_df, visible_windows=None, session_store=None):
     """
-    Compute per-process scores and actions based on virtual allocations.
-
-    Args:
-      virtual_df: pandas.DataFrame (or similar) with columns:
-                  ['pid','name','v_cpu_alloc','v_ram_alloc']
-      visible_windows: optional list of dicts {pid, process_name, title, area}
-      session_store: optional dict-like to persist 'wait_times' and 'usage_history' and 'refresh_interval'
-
-    Returns:
-      list of dicts sorted by score desc. Each dict contains:
-        pid, name, v_cpu_alloc, v_ram_alloc, w_cpu, w_ram, w_wait, w_vis, w_hist,
-        score, action, reason, wait_time_sec
+    Compute per-process scores and actions.
+    Returns list sorted by score desc.
     """
-    # defensive defaults
     if visible_windows is None:
         visible_windows = []
     if session_store is None:
         session_store = {}
 
-    # prepare visible maps
     vis_by_pid = {v['pid']: v for v in visible_windows if isinstance(v.get('pid', None), int)}
     vis_by_name = {}
     total_screen_area = sum((v.get('area', 0) for v in visible_windows)) if visible_windows else 1
@@ -66,7 +56,6 @@ def compute_scores(virtual_df, visible_windows=None, session_store=None):
         pname = v.get('process_name') or v.get('name') or ""
         vis_by_name.setdefault(pname, []).append(v)
 
-    # ensure session store fields
     if 'wait_times' not in session_store:
         session_store['wait_times'] = {}
     if 'usage_history' not in session_store:
@@ -79,16 +68,16 @@ def compute_scores(virtual_df, visible_windows=None, session_store=None):
     refresh_interval = session_store.get('refresh_interval', 2)
 
     results = []
-    # iterate rows defensively (works with pandas.DataFrame)
     for _, row in virtual_df.iterrows():
-        pid = int(row.get('pid', -1) or -1)
+        try:
+            pid = int(row.get('pid', -1) or -1)
+        except Exception:
+            pid = -1
         raw_name = row.get('name', 'unknown')
         name = safe_name(raw_name, pid)
-        # skip system noise
         if name in IGNORE_LIST:
             continue
 
-        # read virtual allocations
         try:
             v_cpu = float(row.get('v_cpu_alloc', 0.0) or 0.0)
         except Exception:
@@ -98,11 +87,12 @@ def compute_scores(virtual_df, visible_windows=None, session_store=None):
         except Exception:
             v_ram = 0.0
 
-        # normalized CPU/RAM weights (0..1)
         w_cpu = max(0.0, min(1.0, v_cpu / VIRTUAL_CPU_UNITS))
-        w_ram = max(0.0, min(1.0, v_ram / VIRTUAL_RAM_MB))
 
-        # visibility weight (if provided)
+        # RAM normalized vs 40% of virtual RAM so it shows visibly on low-end
+        ram_normalizer = max(1.0, VIRTUAL_RAM_MB * 0.4)
+        w_ram = max(0.0, min(1.0, v_ram / ram_normalizer))
+
         vis_area = 0
         if pid in vis_by_pid:
             vis_area = vis_by_pid[pid].get('area', 0)
@@ -113,44 +103,43 @@ def compute_scores(virtual_df, visible_windows=None, session_store=None):
                 vis_area = 0
         w_vis = (vis_area / total_screen_area) if total_screen_area > 0 else 0.0
 
-        # usage history: increment if visible or CPU allocated > threshold
         try:
             if vis_area > 0 or v_cpu > 1.0:
                 usage_history[name] += 1
         except Exception:
-            usage_history[str(name)] = usage_history.get(str(name), 0) + 1
+            usage_history[name] = usage_history.get(name, 0) + 1
 
-        w_hist = min(usage_history.get(name, 0) / 50.0, 1.0)
+        w_hist = min(usage_history.get(name, 0) / 30.0, 1.0)
 
-        # wait-time handling (simulate: if v_cpu small -> waiting)
         prev_wait = wait_times.get(pid, 0.0)
-        if v_cpu < 5.0:
+        if v_cpu < (VIRTUAL_CPU_UNITS * 0.06):  # if allocated very small CPU, it's likely waiting
             prev_wait += refresh_interval
         else:
             prev_wait = max(0.0, prev_wait - refresh_interval)
         wait_times[pid] = prev_wait
-        w_wait = min(prev_wait / 120.0, 1.0)
+        w_wait = min(prev_wait / 90.0, 1.0)
 
-        # combined score
-        score = (
+        score_raw = (
             ALPHA_CPU * w_cpu +
             BETA_RAM * w_ram +
             GAMMA_WAIT * w_wait +
             DELTA_VIS * w_vis +
             EPS_HISTORY * w_hist
         )
-        score = max(0.0, min(1.0, score))  # clamp
+        score = max(0.0, min(1.0, score_raw))
 
-        # decision thresholds
-        if score >= 0.75:
+        # Deadlock heuristic (explicit) + tuned thresholds for low-end demo
+        action = "wait"
+        reason = "Low load — keep waiting"
+        if w_wait > 0.75 and w_cpu < 0.02:
+            action = "deadlocked"
+            reason = "Likely deadlock: waiting long without CPU progress"
+        elif score >= 0.60:
             action = "kill"
-            reason = "High combined virtual CPU+RAM load / visible / frequent"
-        elif score >= 0.45:
+            reason = "High combined load — terminate to recover"
+        elif score >= 0.30:
             action = "preempt"
-            reason = "Moderate virtual load — consider preemption"
-        else:
-            action = "wait"
-            reason = "Low load — keep waiting"
+            reason = "Moderate load — preempt to rebalance"
 
         results.append({
             "pid": pid,
@@ -163,16 +152,15 @@ def compute_scores(virtual_df, visible_windows=None, session_store=None):
             "w_vis": round(w_vis, 3),
             "w_hist": round(w_hist, 3),
             "score": round(score, 3),
+            "raw_score": round(score_raw, 4),
             "action": action,
             "reason": reason,
             "wait_time_sec": round(wait_times.get(pid, 0.0), 1)
         })
 
-    # persist session updates back
     session_store['wait_times'] = wait_times
     session_store['usage_history'] = usage_history
     session_store['refresh_interval'] = refresh_interval
 
-    # sort by score descending
     results.sort(key=lambda x: x['score'], reverse=True)
     return results
